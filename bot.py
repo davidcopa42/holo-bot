@@ -2,6 +2,7 @@ import json # convierte los resultados de las funciones a texto JSON
 import logging # registro de eventos en la terminal
 import os # acceso a las variables de entorno
 from dotenv import load_dotenv # lee el archivo .env
+from pydantic import ValidationError # error que se produce si el JSON no cumple el esquema
 from google import genai # SDK oficial de Gemini
 from telegram import Update # representa cada novedad recibida de Telegram
 from telegram.constants import ChatAction # acciones de chat, como "escribiendo..."
@@ -13,6 +14,7 @@ from telegram.ext import (
     filters, # filtros para seleccionar qué mensajes atender
 )
 import db # módulo propio: acceso a la base SQLite
+from analisis import analizar_resena # análisis estructurado de reseñas
 from herramientas import DECLARACIONES, ejecutar_funcion # funciones propias del bot
 from prompts import PROMPT_SISTEMA # prompt de sistema definido en prompts.py
 
@@ -167,6 +169,9 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start - Presentación de HoloMzaBot\n"
         "/help - Esta ayuda\n\n"
         "/olvidar - Borra nuestra conversación y empezamos de cero\n\n"
+        "/resena <texto> - Dejá tu opinión sobre un producto o servicio\n"
+        "/resenas - Resumen de las opiniones recibidas\n\n"
+        
         "También podés escribirme directamente para:\n"
         "🛍️ Consultar productos y categorías.\n"
         "💲 Conocer precios de productos y variantes.\n"
@@ -182,6 +187,68 @@ async def olvidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Usuario %s borró %d mensajes", update.effective_user.id, borrados)
     await update.message.reply_text("Listo, empezamos de cero. ¿En qué te ayudo?🙂")
 
+async def resena(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde al comando /resena: analiza la reseña y la guarda."""
+
+    # context.args contiene las palabras escritas después del comando,
+    # separadas por espacios: "/resena Muy lindo" → ["Muy", "lindo"].
+    texto = " ".join(context.args).strip()
+
+    if not texto:
+        await update.message.reply_text(
+            "Escribí tu opinión después del comando. Por ejemplo:\n"
+            "/resena El producto fue excelente, pero el envio demoró."
+        )
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    try:
+        analisis = await analizar_resena(cliente_gemini, GEMINI_MODEL, texto)
+
+    except ValidationError:
+        # El modelo respondió, pero el JSON no cumple el esquema.
+        logger.exception("Análisis de reseña con formato inválido")
+        await update.message.reply_text("No pude analizar tu reseña. ¿Probás escribirla de nuevo? 🤔")
+        return
+
+    except Exception as error:
+        logger.exception("Error al analizar la reseña")
+        await update.message.reply_text(describir_error(error))
+        return
+
+    await db.guardar_resena(update.effective_user.id, texto, analisis)
+
+    # El análisis es un objeto: sus campos se usan directamente, sin interpretar texto.
+    emoji = {"positivo": "😊", "neutral": "😐", "negativo": "😞"}[analisis.sentimiento]
+
+    await update.message.reply_text(
+        f"¡Gracias por tu opinión! {emoji}\n\n"
+        f"Sentimiento: {analisis.sentimiento}\n"
+        f"Puntaje: {'⭐' * analisis.puntaje} ({analisis.puntaje}/5)\n"
+        f"Aspectos: {', '.join(analisis.aspectos)}\n"
+        f"Resumen: {analisis.resumen}"
+    )
+
+
+async def resenas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde al comando /resenas: muestra el resumen de todas las reseñas."""
+
+    datos = await db.resumen_resenas()
+
+    if datos["cantidad"] == 0:
+        await update.message.reply_text("Todavía no recibí reseñas. Podés dejar la tuya con /resena.")
+        return
+
+    conteo = datos["por_sentimiento"]
+
+    await update.message.reply_text(
+        f"Reseñas recibidas: {datos['cantidad']}\n"
+        f"Puntaje promedio: {datos['promedio']:.1f}/5\n"  # :.1f muestra un decimal
+        f"Positivas: {conteo.get('positivo', 0)} · "
+        f"Neutrales: {conteo.get('neutral', 0)} · "
+        f"Negativas: {conteo.get('negativo', 0)}"
+    )
 
 #Responder un texto
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -208,7 +275,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await db.guardar_intercambio(user_id, texto, respuesta)
 
     for inicio in range(0, len(respuesta), LIMITE_TELEGRAM):
-        await update.message.reply_text(respuesta[inicio:inicio + LIMITE_TELEGRAM])
+        await update.message.reply_text(respuesta[inicio:inicio + LIMITE_TELEGRAM],parse_mode="Markdown")
 
 
 
@@ -241,10 +308,12 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", ayuda))
     app.add_handler(CommandHandler("olvidar", olvidar)) # nuevo comando de la v3
+    app.add_handler(CommandHandler("resena", resena)) # nuevos comandos de la v5
+    app.add_handler(CommandHandler("resenas", resenas)) # nuevos comandos de la v5
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     app.add_error_handler(manejo_error)
 
-    logger.info("Holo v4 en línea con el modelo %s.", GEMINI_MODEL)
+    logger.info("Holo v5 en línea con el modelo %s.", GEMINI_MODEL)
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
